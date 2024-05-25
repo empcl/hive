@@ -43,6 +43,9 @@ import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.antlr.runtime.ClassicToken;
 import org.antlr.runtime.CommonToken;
 import org.antlr.runtime.Token;
@@ -52,6 +55,7 @@ import org.antlr.runtime.tree.TreeVisitor;
 import org.antlr.runtime.tree.TreeVisitorAction;
 import org.antlr.runtime.tree.TreeWizard;
 import org.antlr.runtime.tree.TreeWizard.ContextVisitor;
+import org.apache.avro.Schema;
 import org.apache.calcite.rel.RelNode;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.lang.mutable.MutableBoolean;
@@ -116,6 +120,7 @@ import org.apache.hadoop.hive.ql.io.HiveOutputFormat;
 import org.apache.hadoop.hive.ql.io.NullRowsInputFormat;
 import org.apache.hadoop.hive.ql.io.RCFileInputFormat;
 import org.apache.hadoop.hive.ql.io.orc.OrcInputFormat;
+import org.apache.hadoop.hive.ql.io.parquet.convert.HiveSchemaConverter;
 import org.apache.hadoop.hive.ql.lib.DefaultGraphWalker;
 import org.apache.hadoop.hive.ql.lib.Dispatcher;
 import org.apache.hadoop.hive.ql.lib.GraphWalker;
@@ -1981,6 +1986,34 @@ public class SemanticAnalyzer extends BaseSemanticAnalyzer {
       String cteName = tabName.toLowerCase();
 
       Table tab = db.getTable(tabName, false);
+      boolean flag = true;
+      if (flag) {
+        org.apache.hadoop.hive.metastore.api.Table tTable = tab.getTTable();
+        String schemaStr = tTable.getParameters().get("1.spark.sql.sources.schema.part.0");
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode node = null;
+        try {
+          node = mapper.readTree(schemaStr).get("fields");
+        } catch (JsonProcessingException e) {
+          throw new RuntimeException(e);
+        }
+
+        List<FieldSchema> newCols = new ArrayList<>();
+
+        int size = node.size();
+        for (int i = 0; i < size; i++) {
+          JsonNode kv = node.get(i);
+          String name = kv.get("name").toString().replace("\"", "");
+          String type = kv.get("type").toString().replace("\"", "");
+          if ("sex".equals(name)) {
+            continue;
+          }
+          FieldSchema fs = new FieldSchema(name, type, "");
+          newCols.add(fs);
+        }
+
+        tTable.getSd().setCols(newCols);
+      }
       if (tab == null ||
               tab.getDbName().equals(SessionState.get().getCurrentDatabase())) {
         Table materializedTab = ctx.getMaterializedTable(cteName);

@@ -18,6 +18,7 @@
 
 package org.apache.hadoop.hive.ql.parse;
 
+import java.lang.reflect.Field;
 import java.math.BigDecimal;
 import java.sql.Date;
 import java.sql.Timestamp;
@@ -33,10 +34,12 @@ import java.util.Stack;
 import org.apache.calcite.rel.RelNode;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.lang3.math.NumberUtils;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.common.type.HiveChar;
 import org.apache.hadoop.hive.common.type.HiveDecimal;
 import org.apache.hadoop.hive.common.type.HiveIntervalDayTime;
 import org.apache.hadoop.hive.common.type.HiveIntervalYearMonth;
+import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.ql.ErrorMsg;
 import org.apache.hadoop.hive.ql.exec.ColumnInfo;
 import org.apache.hadoop.hive.ql.exec.FunctionInfo;
@@ -90,6 +93,7 @@ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils;
 import org.apache.hadoop.hive.serde2.typeinfo.VarcharTypeInfo;
 import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.io.Text;
 import org.apache.hive.common.util.DateUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -666,6 +670,9 @@ public class TypeCheckProcFactory {
             ctx.setError(ErrorMsg.NON_KEY_EXPR_IN_GROUPBY.getMsg(exprNode), expr);
             return null;
           } else {
+            if (ignoreMissingFieldException(((TypeCheckCtx) procCtx).getUnparseTranslator())) {
+              return toExprNodeDesc(new ColumnInfo(tableOrCol, Text.class, tableOrCol, false));
+            }
             List<String> possibleColumnNames = input.getReferenceableColumnAliases(tableOrCol, -1);
             String reason = String.format("(possible column names are: %s)",
                 StringUtils.join(possibleColumnNames, ", "));
@@ -683,6 +690,17 @@ public class TypeCheckProcFactory {
 
     }
 
+    private boolean ignoreMissingFieldException(UnparseTranslator translator) {
+      try {
+        Field confField = translator.getClass().getDeclaredField("conf");
+        confField.setAccessible(true);
+        Configuration conf = (Configuration) confField.get(translator);
+        return Boolean.parseBoolean(conf.get("hoodie.ignore.field.on.schema.evolution", "false"));
+      } catch (Exception e) {
+        LOG.warn("failed to retrieve conf variable from UnparseTranslator, exception : {}", e.getMessage());
+        return false;
+      }
+    }
   }
 
   private static ExprNodeDesc toExprNodeDesc(ColumnInfo colInfo) {
