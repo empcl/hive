@@ -2335,6 +2335,8 @@ public class SemanticAnalyzer extends BaseSemanticAnalyzer {
       }
       List<HoodieSubSchema> hoodieSchemas = getSchemaFromSchemaFile(fs.open(schemaFileOption.get().getPath()));
       List<Long> commits = getAllCompletedCommitInstantTime(fs, new Path(path, ".hoodie"));
+      // findSchemaByInstant 向下获取 instant，所以这里需要一个 0 作为兜底
+      commits.add(0L);
       HoodieSubSchema hoodieSubSchema = findSchemaByInstant(commits, hoodieSchemas,
               Long.parseLong(instantAndMaxCommitConf.getKey()), Integer.parseInt(instantAndMaxCommitConf.getValue()));
       if (hoodieSubSchema.instant.equals(hoodieSchemas.get(0).instant)) {
@@ -2354,7 +2356,11 @@ public class SemanticAnalyzer extends BaseSemanticAnalyzer {
       if (status.isDirectory()) {
         continue;
       }
-      String instantFile = status.getPath().toString().substring(status.getPath().toString().lastIndexOf("/") + 1);
+      String subPathStr = status.getPath().toString();
+      if (subPathStr.startsWith(path.toString() + "/hoodie")) {
+        continue;
+      }
+      String instantFile = subPathStr.substring(subPathStr.lastIndexOf("/") + 1);
       parseInstantTime(instantFile, instantAndCount);
     }
 
@@ -2416,12 +2422,11 @@ public class SemanticAnalyzer extends BaseSemanticAnalyzer {
 
   private HoodieSubSchema findSchemaByInstant(List<Long> commitInstants, List<HoodieSubSchema> hoodieSchemas,
                                               Long startInstantTs, Integer maxCommit) {
-    int size = commitInstants.size();
     int index = findIndexByStartInstant(commitInstants, startInstantTs); // index : start 0
-    if (index + maxCommit >= size) {
+    if (index - maxCommit <= 0) {
       return hoodieSchemas.get(0);
     } else {
-      Long latestInstantTime = commitInstants.get(index + maxCommit);
+      Long latestInstantTime = commitInstants.get(index - maxCommit);
       List<Long> schemaInstants = new ArrayList<>();
       for (HoodieSubSchema hs : hoodieSchemas) {
         schemaInstants.add(Long.parseLong(hs.instant));
