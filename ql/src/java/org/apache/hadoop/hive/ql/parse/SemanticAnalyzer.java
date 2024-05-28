@@ -22,11 +22,15 @@ import static org.apache.hadoop.hive.conf.HiveConf.ConfVars.HIVESTATSDBCLASS;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.Serializable;
+import java.lang.reflect.Field;
 import java.security.AccessControlException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -36,6 +40,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.Queue;
 import java.util.Set;
 import java.util.TreeSet;
@@ -43,9 +48,7 @@ import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.collect.Lists;
 import org.antlr.runtime.ClassicToken;
 import org.antlr.runtime.CommonToken;
 import org.antlr.runtime.Token;
@@ -55,10 +58,11 @@ import org.antlr.runtime.tree.TreeVisitor;
 import org.antlr.runtime.tree.TreeVisitorAction;
 import org.antlr.runtime.tree.TreeWizard;
 import org.antlr.runtime.tree.TreeWizard.ContextVisitor;
-import org.apache.avro.Schema;
 import org.apache.calcite.rel.RelNode;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.lang.mutable.MutableBoolean;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
@@ -120,7 +124,6 @@ import org.apache.hadoop.hive.ql.io.HiveOutputFormat;
 import org.apache.hadoop.hive.ql.io.NullRowsInputFormat;
 import org.apache.hadoop.hive.ql.io.RCFileInputFormat;
 import org.apache.hadoop.hive.ql.io.orc.OrcInputFormat;
-import org.apache.hadoop.hive.ql.io.parquet.convert.HiveSchemaConverter;
 import org.apache.hadoop.hive.ql.lib.DefaultGraphWalker;
 import org.apache.hadoop.hive.ql.lib.Dispatcher;
 import org.apache.hadoop.hive.ql.lib.GraphWalker;
@@ -247,6 +250,11 @@ import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
 import com.google.common.collect.Sets;
 import com.google.common.math.IntMath;
+import org.codehaus.jackson.JsonNode;
+import org.codehaus.jackson.map.ObjectMapper;
+import org.codehaus.jackson.node.ArrayNode;
+
+import javax.annotation.Nullable;
 
 /**
  * Implementation of the semantic analyzer. It generates the query plan.
@@ -1986,33 +1994,15 @@ public class SemanticAnalyzer extends BaseSemanticAnalyzer {
       String cteName = tabName.toLowerCase();
 
       Table tab = db.getTable(tabName, false);
-      boolean flag = true;
-      if (flag) {
+      // get schema evolution conf
+      Configuration hiveSessionConf = getHiveSessionConf(unparseTranslator);
+      boolean schemaEvolutionFullSchemaEnable =
+              Boolean.parseBoolean(hiveSessionConf.get("hoodie.schema.evolution.fullschema.field.enable", "false"));
+      if (schemaEvolutionFullSchemaEnable) {
         org.apache.hadoop.hive.metastore.api.Table tTable = tab.getTTable();
-        String schemaStr = tTable.getParameters().get("1.spark.sql.sources.schema.part.0");
-        ObjectMapper mapper = new ObjectMapper();
-        JsonNode node = null;
-        try {
-          node = mapper.readTree(schemaStr).get("fields");
-        } catch (JsonProcessingException e) {
-          throw new RuntimeException(e);
-        }
-
-        List<FieldSchema> newCols = new ArrayList<>();
-
-        int size = node.size();
-        for (int i = 0; i < size; i++) {
-          JsonNode kv = node.get(i);
-          String name = kv.get("name").toString().replace("\"", "");
-          String type = kv.get("type").toString().replace("\"", "");
-          if ("sex".equals(name)) {
-            continue;
-          }
-          FieldSchema fs = new FieldSchema(name, type, "");
-          newCols.add(fs);
-        }
-
-        tTable.getSd().setCols(newCols);
+        Path path = new Path(tTable.getSd().getLocation());
+        FileSystem fs = getFs(path);
+        resetTableColumns(tTable, path, fs, hiveSessionConf);
       }
       if (tab == null ||
               tab.getDbName().equals(SessionState.get().getCurrentDatabase())) {
@@ -2310,6 +2300,247 @@ public class SemanticAnalyzer extends BaseSemanticAnalyzer {
           throw new SemanticException(generateErrorMessage(ast,
               "Unknown Token Type " + ast.getToken().getType()));
       }
+    }
+  }
+
+  /**
+   * re-specify table column names
+   *   case 1 no incremental read
+   *   case 2 no schema change
+   *   case 3 query in the middle of schema change
+   *   case 4 query in the before of schema change
+   *   case 5 query in the end of schema change
+   */
+  private void resetTableColumns(org.apache.hadoop.hive.metastore.api.Table table, Path path,
+                                 FileSystem fs, Configuration hiveSessionConf) {
+    Pair<String, String> instantAndMaxCommitConf = getIncrementalConf(table, hiveSessionConf);
+    if (instantAndMaxCommitConf.getKey().isEmpty()) {
+      return;
+    }
+    Path schemaDir = new Path(path, ".hoodie/.schema");
+    try {
+      FileStatus[] schemaStatuses = fs.listStatus(schemaDir);
+      if (schemaStatuses.length == 0) {
+        return;
+      }
+
+      Optional<FileStatus> schemaFileOption = Optional.empty();
+      for (FileStatus status : schemaStatuses) {
+        if (status.getPath().toString().endsWith(".schemacommit")) {
+          schemaFileOption = Optional.of(status);
+        }
+      }
+      if (!schemaFileOption.isPresent()) {
+        return;
+      }
+      List<HoodieSubSchema> hoodieSchemas = getSchemaFromSchemaFile(fs.open(schemaFileOption.get().getPath()));
+      List<Long> commits = getAllCompletedCommitInstantTime(fs, new Path(path, ".hoodie"));
+      HoodieSubSchema hoodieSubSchema = findSchemaByInstant(commits, hoodieSchemas,
+              Long.parseLong(instantAndMaxCommitConf.getKey()), Integer.parseInt(instantAndMaxCommitConf.getValue()));
+      if (hoodieSubSchema.instant.equals(hoodieSchemas.get(0).instant)) {
+        return;
+      }
+      resetTableColumnsInternal(table, hoodieSubSchema);
+    } catch (IOException e) {
+      throw new RuntimeException("failed to get file status", e);
+    }
+  }
+
+  private List<Long> getAllCompletedCommitInstantTime(FileSystem fs, Path path) throws IOException {
+    FileStatus[] statuses = fs.listStatus(path);
+    Map<Long, Integer> instantAndCount = new HashMap<>();
+
+    for (FileStatus status : statuses) {
+      if (status.isDirectory()) {
+        continue;
+      }
+      String instantFile = status.getPath().toString().substring(status.getPath().toString().lastIndexOf("/") + 1);
+      parseInstantTime(instantFile, instantAndCount);
+    }
+
+    List<Long> completedCommitInstants = new ArrayList<>();
+    for (Entry<Long, Integer> entry : instantAndCount.entrySet()) {
+      if (entry.getValue() == 3) {
+        completedCommitInstants.add(entry.getKey());
+      }
+    }
+
+    // reversed sort
+    Collections.sort(completedCommitInstants, new Comparator<Long>() {
+      @Override
+      public int compare(Long o1, Long o2) {
+        return o2.compareTo(o1);
+      }
+    });
+
+    return completedCommitInstants;
+  }
+
+  private void parseInstantTime(String instantFile, Map<Long, Integer> instantAndCount) {
+    if (instantFile.startsWith(".hoodie")) {
+      return;
+    }
+    String instantStr;
+    if (instantFile.contains("_")) {
+      instantStr = instantFile.substring(0, instantFile.indexOf("_"));
+    } else if (instantFile.contains(".")) {
+      instantStr = instantFile.substring(0, instantFile.indexOf("."));
+    } else {
+      LOG.info(instantFile + "may not be a legal hoodie instant, ignore.");
+      return;
+    }
+
+    Long instant = Long.parseLong(instantStr);
+    if (instantAndCount.containsKey(instant)) {
+      instantAndCount.put(instant, instantAndCount.get(instant) + 1);
+    } else {
+      instantAndCount.put(instant, 1);
+    }
+  }
+
+  private Pair<String, String> getIncrementalConf(org.apache.hadoop.hive.metastore.api.Table table, Configuration conf) {
+    String tableName = table.getTableName();
+    String consumeModeStr = "hoodie." + tableName + ".consume.mode";
+    String consumeStartTimestampStr = "hoodie." + tableName + ".consume.start.timestamp";
+    String consumeMaxCommitStr = "hoodie." + tableName + ".consume.max.commits";
+    if (isEmpty(conf, consumeModeStr, "INCREMENTAL") ||
+        isEmpty(conf, consumeStartTimestampStr, null) ||
+        isEmpty(conf, consumeMaxCommitStr, null)) {
+        return Pair.of("", "");
+    }
+    String startTimestamp = conf.get(consumeStartTimestampStr);
+    String maxCommit = conf.get(consumeMaxCommitStr);
+
+    return Pair.of(startTimestamp, maxCommit);
+  }
+
+  private HoodieSubSchema findSchemaByInstant(List<Long> commitInstants, List<HoodieSubSchema> hoodieSchemas,
+                                              Long startInstantTs, Integer maxCommit) {
+    int size = commitInstants.size();
+    int index = findIndexByStartInstant(commitInstants, startInstantTs); // index : start 0
+    if (index + maxCommit >= size) {
+      return hoodieSchemas.get(0);
+    } else {
+      Long latestInstantTime = commitInstants.get(index + maxCommit);
+      List<Long> schemaInstants = new ArrayList<>();
+      for (HoodieSubSchema hs : hoodieSchemas) {
+        schemaInstants.add(Long.parseLong(hs.instant));
+      }
+      int schemaIndex = findIndexByStartInstant(schemaInstants, latestInstantTime);
+      return hoodieSchemas.get(schemaIndex);
+    }
+  }
+
+  private boolean isEmpty(Configuration conf, String key, @Nullable String expectedValue) {
+    if (conf.get(key) != null) {
+      if (expectedValue != null) {
+        return !expectedValue.equalsIgnoreCase(conf.get(key));
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private int findIndexByStartInstant(List<Long> commitInstants, long startInstantTs) {
+    int size = commitInstants.size();
+    int left = 0;
+    int right = size - 1;
+
+    while (left < right) {
+      int mid = (right - left) / 2 + left;
+      long instant = commitInstants.get(mid);
+      if (instant == startInstantTs) {
+        return mid;
+      } else if (instant > startInstantTs) {
+        left = mid + 1;
+      } else {
+        right = mid;
+      }
+    }
+
+    return right;
+  }
+
+  private void resetTableColumnsInternal(org.apache.hadoop.hive.metastore.api.Table table, HoodieSubSchema hoodieSubSchema) {
+    List<Pair<String, String>> schemas = hoodieSubSchema.schemas;
+    List<FieldSchema> fss = new ArrayList<>();
+    List<String> partitions = new ArrayList<>();
+    List<FieldSchema> partitionSchemas = table.getPartitionKeys();
+    for (FieldSchema psf : partitionSchemas) {
+      partitions.add(psf.getName());
+    }
+    for (Pair<String, String> schema : schemas) {
+      String fieldName = schema.getKey();
+      if (partitions.contains(fieldName)) {
+        continue;
+      }
+      String fieldType = convertType(schema.getValue());
+      fss.add(new FieldSchema(fieldName, fieldType, null));
+    }
+
+    table.getSd().setCols(fss);
+  }
+
+  // TODO 可能需要完善
+  private String convertType(String type) {
+    if (type.equals("long")) {
+      return "bigint";
+    }
+    return type;
+  }
+
+  private List<HoodieSubSchema> getSchemaFromSchemaFile(InputStream is) throws IOException {
+    List<HoodieSubSchema> schemas = new ArrayList<>();
+    ObjectMapper mapper = new ObjectMapper();
+    JsonNode rootNode = mapper.readTree(is);
+    ArrayNode schemasArrNode = (ArrayNode) rootNode.get("schemas");
+    for (JsonNode node : schemasArrNode) {
+      String instant = node.get("version_id").asText();
+      ArrayNode schemaFields = (ArrayNode) node.get("fields");
+      List<Pair<String, String>> list = new ArrayList<>();
+      for (JsonNode field : schemaFields) {
+        String name = field.get("name").asText();
+        String type = field.get("type").asText();
+        list.add(Pair.of(name, type));
+      }
+      HoodieSubSchema schema = new HoodieSubSchema(instant, list);
+      schemas.add(schema);
+    }
+
+    HoodieSubSchema latestSchema = new HoodieSubSchema("29000000000000000", schemas.get(0).schemas);
+    return Lists.asList(latestSchema, schemas.toArray(new HoodieSubSchema[]{}));
+  }
+
+  private FileSystem getFs(Path path) {
+    try {
+      return path.getFileSystem(conf);
+    } catch (IOException e) {
+      throw new RuntimeException("failed to get fs.", e);
+    }
+  }
+
+  private Configuration getHiveSessionConf(UnparseTranslator translator) {
+    try {
+      Field confField = translator.getClass().getDeclaredField("conf");
+      confField.setAccessible(true);
+      return (Configuration) confField.get(translator);
+    } catch (Exception e) {
+      LOG.warn("failed to retrieve conf variable from UnparseTranslator, exception : {}", e.getMessage());
+      return null;
+    }
+  }
+
+  static class HoodieSubSchema {
+    private String instant;
+    private List<Pair<String, String>> schemas;
+    public HoodieSubSchema(String instant, List<Pair<String, String>> schemas) {
+      this.instant = instant;
+      this.schemas = schemas;
+    }
+
+    public String getInstant() {
+      return instant;
     }
   }
 
@@ -10406,7 +10637,7 @@ public class SemanticAnalyzer extends BaseSemanticAnalyzer {
       // Currently, partition spec can only be static partition.
       String k = MetaStoreUtils.encodeTableName(tblName) + Path.SEPARATOR;
       tsDesc.setStatsAggPrefix(tab.getDbName()+"."+k);
-      
+
       // set up WriteEntity for replication
       outputs.add(new WriteEntity(tab, WriteEntity.WriteType.DDL_SHARED));
 
@@ -10854,7 +11085,7 @@ public class SemanticAnalyzer extends BaseSemanticAnalyzer {
 
     void setCTASToken(ASTNode child) {
     }
-    
+
     void setViewToken(ASTNode child) {
     }
 
@@ -11219,7 +11450,7 @@ public class SemanticAnalyzer extends BaseSemanticAnalyzer {
       if (ctx.getExplainAnalyze() == AnalyzeState.RUNNING) {
         return;
       }
-      
+
       if (!ctx.isCboSucceeded()) {
         saveViewDefinition();
       }

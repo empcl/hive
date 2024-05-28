@@ -313,6 +313,8 @@ public final class TypeInfoUtils {
     }
 
     public TypeInfoParser(String typeInfoString) {
+//      typeInfoString = typeInfoString.replaceAll("integer", "int");
+//      typeInfoString = typeInfoString.replaceAll("long", "bigint");
       this.typeInfoString = typeInfoString;
       typeInfoTokens = tokenize(typeInfoString);
     }
